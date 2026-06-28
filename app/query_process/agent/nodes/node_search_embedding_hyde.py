@@ -7,13 +7,12 @@ if __package__ in (None, ""):
         sys.path.insert(0, project_root)
 
 from app.utils.task_utils import add_running_task, add_done_task
-from app.lm.lm_utils import *
-from app.lm.embedding_utils import *
-from app.clients.milvus_utils import *
+from app.clients.milvus_utils import create_hybrid_search_requests, hybrid_search, get_milvus_client
 from app.core.logger import logger
 from app.core.load_prompt import load_prompt
 from dotenv import load_dotenv, find_dotenv
 from app.conf.milvus_config import milvus_config
+from app.utils.escape_milvus_string_utils import escape_milvus_string
 load_dotenv(find_dotenv())
 
 def step1_generate_hyde_document(query)->str:
@@ -31,6 +30,7 @@ def step1_generate_hyde_document(query)->str:
     try:
         logger.info(f"Step 1: 生成HyDE文档 - 输入查询: '{query}'")
         prompt_template = load_prompt("hyde_prompt",rewritten_query=query)
+        from app.lm.lm_utils import get_llm_client
         llm_client = get_llm_client()
         response = llm_client.invoke(prompt_template)
         hyde_document=response.content.strip()
@@ -41,7 +41,7 @@ def step1_generate_hyde_document(query)->str:
         raise e
     
 def step2_search_with_hyde(query, hyde_document, item_names, req_limit = 10,top_k=5,
-                           ranker_weight=(0.9,0.1),norm_score: bool = True,output_fields=["chunk_id", "content", "item_name"]):
+                           ranker_weight=(0.9,0.1),norm_score: bool = True,output_fields=["chunk_id", "content", "item_name"], course_id: str = ""):
     """
     阶段2：利用“重写问题 + 假设性文档”生成 embedding，并到向量库检索切片。
     :param query: 改写后的查询
@@ -60,11 +60,15 @@ def step2_search_with_hyde(query, hyde_document, item_names, req_limit = 10,top_
     # 1. 拼接查询与假设文档，形成更丰富的语义上下文
     combined_text = f"{query}\n{hyde_document}"
     # 2. 生成向量 (Dense + Sparse)
+    from app.lm.embedding_utils import generate_embeddings
     embedding = generate_embeddings([combined_text])
     # 3. 准备 Milvus 检索的过滤条件，基于商品名称进行元数据过滤
     collection_name = milvus_config.chunks_collection
-    expr_str = ", ".join([f'"{item}"' for item in item_names])
-    expr = f'item_name in [{expr_str}]' if item_names else ""
+    if course_id:
+        expr = f'course_id == "{escape_milvus_string(course_id)}"'
+    else:
+        expr_str = ", ".join([f'"{item}"' for item in item_names])
+        expr = f'item_name in [{expr_str}]' if item_names else ""
     try:
         reqs = create_hybrid_search_requests(embedding["dense"][0], embedding["sparse"][0], expr=expr, limit=req_limit)
         client = get_milvus_client()
@@ -92,6 +96,13 @@ def node_search_embedding_hyde(state):
     if not query:
         query = state.get("original_query", "")
     item_names = state.get("item_names", [])
+    course_id = state.get("course_id", "")
+    if state.get("mode") == "exam" and state.get("exam_chunks"):
+        logger.info(f"- {function_name} - 出卷模式已获取试卷切片，跳过HyDE扩展检索")
+        add_done_task(state["session_id"], function_name, state.get("is_stream", False))
+        return {
+            "hyde_embedding_chunks": []
+        }
     logger.info(f"- {function_name} - 开始执行，输入状态: rewritten_query='{query}', item_names={item_names}")
     hyde_document = ""
     try:
@@ -103,7 +114,14 @@ def node_search_embedding_hyde(state):
     
     try:
         # 3. 混合检索
-        res = step2_search_with_hyde(query, hyde_document, item_names,top_k=5)
+        res = step2_search_with_hyde(
+            query,
+            hyde_document,
+            item_names,
+            top_k=8 if state.get("mode") == "exam" else 5,
+            output_fields=["chunk_id", "content", "item_name", "course_id", "course_name", "material_type", "file_title"],
+            course_id=course_id,
+        )
         add_done_task(state["session_id"], function_name, state.get("is_stream", False))
         return {
             "hyde_embedding_chunks": res[0] if res else []

@@ -47,6 +47,9 @@ def step2_prepare_milvus_collection():
         schema.add_field(field_name="part", datatype=DataType.INT8)
         schema.add_field(field_name="file_title", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=65535)
+        schema.add_field(field_name="course_id", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="course_name", datatype=DataType.VARCHAR, max_length=1024)
+        schema.add_field(field_name="material_type", datatype=DataType.VARCHAR, max_length=128)
         schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
         schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
 
@@ -94,7 +97,12 @@ def step3_clean_old_data(milvus_client, chunks):
     if not item_names:
         logger.warning("步骤3 - 没有有效的item_name可用于幂等清理，跳过删除")
         return
-    delete_expression = " OR ".join([f'item_name == "{name}"' for name in item_names])
+    course_ids = list(set(chunk.get("course_id") for chunk in chunks if chunk.get("course_id")))
+    delete_parts = [f'item_name == "{name}"' for name in item_names]
+    delete_expression = " OR ".join(delete_parts)
+    if course_ids:
+        course_expr = " OR ".join([f'course_id == "{course_id}"' for course_id in course_ids])
+        delete_expression = f"({delete_expression}) and ({course_expr})"
     logger.info(f"步骤3 - 开始幂等清理Milvus中item_name在{item_names}的旧数据")
     milvus_client.delete(collection_name=CHUNKS_COLLECTION_NAME, filter=delete_expression)
 

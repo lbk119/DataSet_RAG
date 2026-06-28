@@ -46,6 +46,7 @@ class HistoryMongoTool:
             # 索引规则：session_id升序 + ts降序，适配"按会话查最新记录"的核心查询场景
             # create_index自带幂等性：索引已存在时不会重复创建，无需额外判断
             self.chat_message.create_index([("session_id", 1), ("ts", -1)])
+            self.chat_message.create_index([("session_id", 1), ("course_id", 1), ("ts", -1)])
 
             # 记录成功日志，确认数据库连接和初始化完成
             logging.info(f"Successfully connected to MongoDB: {self.db_name}")
@@ -67,6 +68,25 @@ except Exception as e:
     # 初始化失败时仅记录警告日志，不抛出异常
     # 原因：模块加载阶段的异常可能导致整个程序启动失败，此处保留懒加载兜底（get_history_mongo_tool会再次尝试创建）
     logging.warning(f"Could not initialize HistoryMongoTool on module load: {e}")
+
+def _serialize_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    将MongoDB文档转为FastAPI可直接返回的JSON友好字典。
+    """
+    serialized = {}
+    for key, value in message.items():
+        if isinstance(value, ObjectId):
+            serialized[key] = str(value)
+        elif isinstance(value, list):
+            serialized[key] = [
+                str(item) if isinstance(item, ObjectId) else item
+                for item in value
+            ]
+        elif isinstance(value, dict):
+            serialized[key] = _serialize_message(value)
+        else:
+            serialized[key] = value
+    return serialized
 
 def get_history_mongo_tool() -> HistoryMongoTool:
     """
@@ -113,7 +133,10 @@ def save_chat_message(
         rewritten_query: str = "",
         item_names: List[str] = None,
         image_urls: List[str] = None,
-        message_id: str = None
+        message_id: str = None,
+        course_id: str = "",
+        course_name: str = "",
+        mode: str = "qa",
 ) -> str:
     """
     写入/更新单条会话记录到MongoDB
@@ -138,6 +161,9 @@ def save_chat_message(
         "rewritten_query": rewritten_query or "",  # 重写查询，空值处理为空字符串
         "item_names": item_names,  # 关联商品名称列表
         "image_urls": image_urls,  # 关联图片URL列表
+        "course_id": course_id or "",
+        "course_name": course_name or "",
+        "mode": mode or "qa",
         "ts": ts  # 时间戳，排序和时间筛选维度
     }
 
@@ -190,7 +216,7 @@ def update_message_item_names(ids: List[str], item_names: List[str]) -> int:
         return 0
 
 
-def get_recent_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+def get_recent_messages(session_id: str, limit: int = 10, course_id: str = "") -> List[Dict[str, Any]]:
     """
     查询指定会话的最近N条对话记录，返回原始字典格式
     结果按时间正序排列，可直接喂给LLM作为上下文
@@ -203,6 +229,8 @@ def get_recent_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]
     try:
         # 构造查询条件：仅查询指定session_id的记录
         query = {"session_id": session_id}
+        if course_id:
+            query["course_id"] = course_id
 
         # 执行查询：按时间戳升序排序，限制返回条数
         # find(query)：获取符合条件的游标（惰性加载，不立即查询）
@@ -210,7 +238,7 @@ def get_recent_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]
         # limit(limit)：限制返回的最大条数
         cursor = mongo_tool.chat_message.find(query).sort("ts", ASCENDING).limit(limit)
         # 将游标转为列表，触发实际数据库查询，获取所有符合条件的文档
-        messages = list(cursor)
+        messages = [_serialize_message(message) for message in cursor]
         # 返回查询结果列表
         return messages
     except Exception as e:
@@ -240,3 +268,4 @@ if __name__ == "__main__":
     # 遍历打印每条记录的详细内容
     for m in messages:
         print(f" {m}  ")
+    

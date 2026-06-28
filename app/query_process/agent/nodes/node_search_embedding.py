@@ -7,13 +7,59 @@ if __package__ in (None, ""):
         sys.path.insert(0, project_root)
 
 from app.utils.task_utils import add_running_task,add_done_task
-from app.lm.embedding_utils import generate_embeddings
 from app.clients.milvus_utils import create_hybrid_search_requests,hybrid_search,get_milvus_client
 from app.core.logger import logger
 from dotenv import load_dotenv,find_dotenv
 from app.query_process.agent.state import QueryGraphState
 from app.conf.milvus_config import milvus_config
+from app.utils.escape_milvus_string_utils import escape_milvus_string
 load_dotenv(find_dotenv())
+
+EXAM_CONTEXT_LIMIT = 30
+OUTPUT_FIELDS = ["chunk_id", "content", "item_name", "course_id", "course_name", "material_type", "file_title"]
+
+
+def _build_course_expr(course_id: str, mode: str = "qa") -> str:
+    if not course_id:
+        return ""
+    expr = f'course_id == "{escape_milvus_string(course_id)}"'
+    if mode == "exam":
+        # 考试预测优先试卷，但保留课件/教材作为补充由排序阶段决定。
+        return expr
+    return expr
+
+def _fetch_exam_chunks(client, collection_name: str, course_id: str, limit: int = EXAM_CONTEXT_LIMIT):
+    if not course_id:
+        return []
+    expr = f'course_id == "{escape_milvus_string(course_id)}" and material_type == "exam"'
+    try:
+        rows = client.query(
+            collection_name=collection_name,
+            filter=expr,
+            output_fields=OUTPUT_FIELDS,
+            limit=limit,
+        )
+    except TypeError:
+        rows = client.query(
+            collection_name=collection_name,
+            filter=expr,
+            output_fields=OUTPUT_FIELDS,
+        )
+        rows = rows[:limit]
+    except Exception as e:
+        logger.warning(f"出卷模式试卷切片查询失败，将只使用向量召回结果: {e}")
+        return []
+
+    chunks = []
+    for index, row in enumerate(rows or []):
+        chunk_id = row.get("chunk_id") or row.get("id") or f"exam-{index}"
+        chunks.append({
+            "id": chunk_id,
+            "distance": 1.0,
+            "entity": row,
+        })
+    logger.info(f"出卷模式额外召回往年试卷切片数量: {len(chunks)}")
+    return chunks
 
 def node_search_embedding(state:QueryGraphState)->QueryGraphState:
     """
@@ -35,28 +81,62 @@ def node_search_embedding(state:QueryGraphState)->QueryGraphState:
     add_running_task(state["session_id"], function_name, state.get("is_stream", False))
     query = state.get("rewritten_query", "")
     item_names = state.get("item_names", [])
-    if not item_names:
+    course_id = state.get("course_id", "")
+    if not item_names and not course_id:
         logger.warning(f"- {function_name} - 没有确认的商品名称，无法执行基于商品过滤的检索")
         state["embedding_chunks"] = []
         add_done_task(state["session_id"], function_name, state.get("is_stream", False))
         return state
     logger.info(f"- {function_name} - 开始执行，输入状态: rewritten_query='{query}', item_names={item_names}")
+    collection_name = milvus_config.chunks_collection
+    client = get_milvus_client()
+    if state.get("mode") == "exam" and course_id:
+        print(f"[node_search_embedding] exam mode: fetching exam chunks before embedding session={state['session_id']}", flush=True)
+        exam_chunks = _fetch_exam_chunks(client, collection_name, course_id)
+        if exam_chunks:
+            state["embedding_chunks"] = []
+            state["exam_chunks"] = exam_chunks
+            add_done_task(state["session_id"], function_name, state.get("is_stream", False))
+            return {
+                "embedding_chunks": [],
+                "exam_chunks": exam_chunks,
+            }
+
     # 1. 对改写后的用户问题执行向量化，生成BGEM3稠密+稀疏向量
+    print(f"[node_search_embedding] importing embedding utils session={state['session_id']}", flush=True)
+    from app.lm.embedding_utils import generate_embeddings
+    print(f"[node_search_embedding] generating query embedding session={state['session_id']}", flush=True)
     embeddings = generate_embeddings([query])
     dense_vector = embeddings.get("dense")[0]  # 获取第一个文本的稠密向量
     sparse_vector = embeddings.get("sparse")[0]  # 获取第一个文本的稀疏向量
     # 2. 准备Milvus向量数据库连接相关配置，指定检索的集合
-    collection_name = milvus_config.chunks_collection
     # 3. 构造带商品名过滤的混合搜索请求
-    expr_str = ", ".join([f'"{name}"' for name in item_names])  # 构造过滤表达式字符串
-    expr = f'item_name in [{expr_str}]'  # 构造最终过滤表达式
+    if course_id:
+        expr = _build_course_expr(course_id, state.get("mode", "qa"))
+    else:
+        expr_str = ", ".join([f'"{name}"' for name in item_names])  # 构造过滤表达式字符串
+        expr = f'item_name in [{expr_str}]'  # 构造最终过滤表达式
     search_requests = create_hybrid_search_requests(dense_vector, sparse_vector, expr = expr, limit = 10)
     # 4. 执行Milvus稠密+稀疏混合向量检索
-    client = get_milvus_client()
-    search_results = hybrid_search(client, collection_name, search_requests,(0.9, 0.1),True,5,output_fields=["chunk_id", "content", "item_name"]) 
+    search_results = hybrid_search(
+        client,
+        collection_name,
+        search_requests,
+        (0.9, 0.1),
+        True,
+        12 if state.get("mode") == "exam" else 5,
+        output_fields=OUTPUT_FIELDS,
+    ) 
     state["embedding_chunks"] = search_results[0] if search_results else []  # 获取第一个请求的检索结果，若无结果则为空列表
+    exam_chunks = []
+    if state.get("mode") == "exam" and course_id:
+        exam_chunks = _fetch_exam_chunks(client, collection_name, course_id)
+        state["exam_chunks"] = exam_chunks
     add_done_task(state["session_id"], function_name, state.get("is_stream", False))
-    return {"embedding_chunks": state["embedding_chunks"]}
+    return {
+        "embedding_chunks": state["embedding_chunks"],
+        "exam_chunks": exam_chunks,
+    }
 
 
 if __name__ == "__main__":

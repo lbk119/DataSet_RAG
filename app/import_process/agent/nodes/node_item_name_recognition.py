@@ -148,6 +148,9 @@ def step4_backfill_data(state: ImportGraphState, chunks: List[Dict[str, Any]], i
     state["item_name"] = item_name  # 在状态对象中添加item_name字段，便于全局访问
     for chunk in chunks:
         chunk["item_name"] = item_name  # 在每个切片字典中添加item_name字段
+        chunk["course_id"] = state.get("course_id", "")
+        chunk["course_name"] = state.get("course_name", "")
+        chunk["material_type"] = state.get("material_type", "other")
     state["chunks"] = chunks  # 更新状态对象中的chunks列表
 
 def step5_generate_vectors(item_name: str) -> Tuple[List[float], List[Dict[int, float]]]:
@@ -205,6 +208,9 @@ def step6_store_in_milvus(state: ImportGraphState, file_title: str, item_name: s
         schema.add_field(field_name="pk", datatype=DataType.INT64, is_primary=True,auto_id=True) # 添加自增主键字段：INT64类型，唯一标识每条数据
         schema.add_field(field_name="file_title", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=65535)
+        schema.add_field(field_name="course_id", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="course_name", datatype=DataType.VARCHAR, max_length=1024)
+        schema.add_field(field_name="material_type", datatype=DataType.VARCHAR, max_length=128)
         schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=len(dense_vector))
         schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
 
@@ -234,11 +240,20 @@ def step6_store_in_milvus(state: ImportGraphState, file_title: str, item_name: s
         logger.info(f"步骤6 - Milvus集合[{collection_name}]创建成功")
     # 幂等性处理：删除同名商品数据，避免重复存储（核心：先加载集合才能删除）
     milvus_client.load_collection(collection_name=collection_name)  # 加载集合，确保数据可见
-    milvus_client.delete(collection_name=collection_name, filter=f"item_name == '{escape_milvus_string(item_name)}'")  # 删除同名商品数据，保证幂等性
+    course_id = state.get("course_id", "")
+    escaped_item_name = escape_milvus_string(item_name)
+    escaped_course_id = escape_milvus_string(course_id)
+    delete_filter = f'item_name == "{escaped_item_name}"'
+    if course_id:
+        delete_filter = f'{delete_filter} and course_id == "{escaped_course_id}"'
+    milvus_client.delete(collection_name=collection_name, filter=delete_filter)  # 删除同名主体数据，保证课程内幂等
     # 构造待插入数据，非空向量才添加
     insert_data = {
         "file_title": file_title,
         "item_name": item_name,
+        "course_id": course_id,
+        "course_name": state.get("course_name", ""),
+        "material_type": state.get("material_type", "other"),
     }
     if dense_vector:
         insert_data["dense_vector"] = dense_vector

@@ -62,12 +62,15 @@ def node_rrf(state):
     # 1. 提取各路检索结果
     embedding_chunks = state.get("embedding_chunks", [])
     hyde_embedding_chunks = state.get("hyde_embedding_chunks", [])
+    exam_chunks = state.get("exam_chunks", [])
     source_weights = [
+        (exam_chunks, 3.0),  # 出卷模式下额外召回的试卷切片优先级最高
         (embedding_chunks, 1.0),  # Embedding检索权重
         (hyde_embedding_chunks, 1.0)  # HyDE检索权重
     ]
     # 2. 应用带权重的RRF计算最终得分
-    response = step2_reciprocal_rank(source_weights)
+    top_k = 20 if state.get("mode") == "exam" else 5
+    response = step2_reciprocal_rank(source_weights, k=top_k)
     # 3. 更新状态并返回结果
     state["rrf_chunks"] = response
     add_done_task(state["session_id"], function_name, state.get("is_stream", False))

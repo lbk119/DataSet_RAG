@@ -12,11 +12,95 @@ from app.utils.sse_utils import push_to_session, SSEEvent
 from app.query_process.agent.state import QueryGraphState
 from app.core.logger import logger
 from app.core.load_prompt import load_prompt
-from app.lm.lm_utils import get_llm_client
 from app.clients.mongo_history_utils import save_chat_message
 import re
 _IMAGE_BLOCK_MARKER = "【图片】"
 MAX_CONTEXT_CHARS = 12000
+MAX_EXAM_CONTEXT_CHARS = 30000
+
+MATH_ENV_PATTERN = re.compile(
+    r"^\s*\\begin\{(cases|aligned|align\*?|array|matrix|pmatrix|bmatrix|vmatrix|equation\*?|split|gather\*?)\}"
+)
+
+def _strip_line_prefix(line: str) -> str:
+    return re.sub(r"^(?:>\s*|[-*]\s+|\d+\.\s+|#+\s+)", "", line.strip()).strip()
+
+def _is_likely_math_line(line: str) -> bool:
+    cleaned = _strip_line_prefix(line)
+    if not cleaned or len(cleaned) > 700:
+        return False
+    if MATH_ENV_PATTERN.match(cleaned):
+        return True
+    if re.match(r"^\\(boxed|frac|omega|sum|int|lim|sqrt|left|right)", cleaned):
+        return True
+
+    chinese_count = len(re.findall(r"[\u4e00-\u9fff]", cleaned))
+    has_math_command = re.search(
+        r"\\(frac|Rightarrow|rightarrow|begin|end|boxed|quad|text|cdot|leq|geq|neq|omega|xi|in|sum|int|sqrt|left|right)",
+        cleaned,
+    )
+    has_math_symbol = re.search(r"[=^_{}]|[+\-*/×÷]|≤|≥|≠|≈", cleaned)
+    starts_like_math = re.match(r"^(\(?\d+\)?\s*)?([A-Za-z]\\?|'|\\[A-Za-z]+|\(|\[|{|[0-9.-])", cleaned)
+    return bool(has_math_symbol and ((starts_like_math and chinese_count <= 4) or (has_math_command and chinese_count <= 10)))
+
+def normalize_answer_markdown(answer: str) -> str:
+    """Make model math output easier for the chat page to render cleanly."""
+    if not answer:
+        return answer
+
+    lines = answer.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    in_code = False
+    in_display_math = False
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        if stripped == "$$":
+            in_display_math = not in_display_math
+            out.append(line)
+            i += 1
+            continue
+
+        if in_display_math or stripped.startswith("$$") or stripped.endswith("$$"):
+            out.append(line)
+            i += 1
+            continue
+
+        env_match = MATH_ENV_PATTERN.match(_strip_line_prefix(line))
+        if env_match:
+            env = env_match.group(1)
+            block = [_strip_line_prefix(line)]
+            i += 1
+            while i < len(lines):
+                block.append(lines[i])
+                if f"\\end{{{env}}}" in lines[i]:
+                    break
+                i += 1
+            out.extend(["$$", "\n".join(block).strip(), "$$"])
+            i += 1
+            continue
+
+        if _is_likely_math_line(line):
+            out.extend(["$$", _strip_line_prefix(line), "$$"])
+        else:
+            out.append(line)
+        i += 1
+
+    return "\n".join(out)
 
 def step1_check_existing_answer(state: QueryGraphState) -> bool:
     """
@@ -48,21 +132,48 @@ def step2_load_prompt(state: QueryGraphState) -> str:
     history = state.get("history", [])
     item_names = state.get("item_names", [])
     reranked_docs = state.get("reranked_docs", [])
+    course_name = state.get("course_name", "")
+    mode = state.get("mode", "qa")
+    attachment_context = (state.get("attachment_context", "") or "").strip()
     # 处理reranked_docs
     docs = []
+    exam_docs = []
+    support_docs = []
     used_length = 0
+    max_context_chars = MAX_EXAM_CONTEXT_CHARS if mode == "exam" else MAX_CONTEXT_CHARS
     for i,doc in enumerate(reranked_docs,start=1):
         title = doc.get("title", "")
         text = doc.get("text", "")
         source = doc.get("source", "")
+        material_type = doc.get("material_type", "")
         score = doc.get("score", 0.0)
-        content = f"Document {i} (Source: {source}, Title: {title}, Score: {score}): {text}\n"
-        if used_length + len(content) > MAX_CONTEXT_CHARS:
-            logger.info(f"文档内容超过最大限制，已截断。当前已使用字符数: {used_length}, 新文档字符数: {len(content)}, 最大限制: {MAX_CONTEXT_CHARS}")
+        content = f"Document {i} (Source: {source}, Type: {material_type}, Title: {title}, Score: {score}): {text}\n"
+        if used_length + len(content) > max_context_chars:
+            logger.info(f"文档内容超过最大限制，已截断。当前已使用字符数: {used_length}, 新文档字符数: {len(content)}, 最大限制: {max_context_chars}")
             break
-        docs.append(content)
+        if mode == "exam" and material_type == "exam":
+            exam_docs.append(content)
+        elif mode == "exam":
+            support_docs.append(content)
+        else:
+            docs.append(content)
         used_length += len(content)
-    context = "\n".join(docs)
+    if mode == "exam":
+        context = (
+            "【往年试卷结构依据】\n"
+            + ("\n".join(exam_docs) if exam_docs else "未检索到 material_type=exam 的往年试卷切片，请降低结构确定性并说明依据不足。")
+            + "\n\n【补充课程资料】\n"
+            + ("\n".join(support_docs) if support_docs else "无补充课程资料。")
+        )
+    else:
+        context = "\n".join(docs)
+    if attachment_context:
+        context = (
+            "【用户本次上传附件解析结果】\n"
+            + attachment_context
+            + "\n\n【课程知识库检索结果】\n"
+            + (context or "无")
+        )
     # 处理history
     history_str = ""
     if history and len(history) > 0:
@@ -76,8 +187,8 @@ def step2_load_prompt(state: QueryGraphState) -> str:
                 current_turn = f"Turn {i}:\nAssistant: {text}\n"
             history_str += current_turn
             used_length += len(current_turn)
-            if used_length >= MAX_CONTEXT_CHARS:
-                logger.info(f"历史对话内容超过最大限制，已截断。当前已使用字符数: {used_length}, 新历史对话字符数: {len(current_turn)}, 最大限制: {MAX_CONTEXT_CHARS}")
+            if used_length >= max_context_chars:
+                logger.info(f"历史对话内容超过最大限制，已截断。当前已使用字符数: {used_length}, 新历史对话字符数: {len(current_turn)}, 最大限制: {max_context_chars}")
                 break
     else:
         history_str = "没有历史对话记录"
@@ -86,7 +197,10 @@ def step2_load_prompt(state: QueryGraphState) -> str:
     item_names_str = ", ".join(item_names)
 
     # 加载prompt模板
-    prompt_template = load_prompt("answer_out", context=context, history=history_str, item_names=item_names_str, question=rewritten_query)
+    if mode == "exam":
+        prompt_template = load_prompt("exam_generation", context=context, history=history_str, course_name=course_name, question=rewritten_query)
+    else:
+        prompt_template = load_prompt("answer_out", context=context, history=history_str, item_names=item_names_str or course_name, question=rewritten_query)
     return prompt_template
 
 def step3_generate_answer(state: QueryGraphState, prompt_template: str) -> str:
@@ -96,19 +210,38 @@ def step3_generate_answer(state: QueryGraphState, prompt_template: str) -> str:
     :param prompt_template: 组织好的prompt字符串
     :return: 大模型生成的答案字符串
     """
+    from app.lm.lm_utils import get_llm_client
+
     llm_client = get_llm_client()
     is_stream = state.get("is_stream", False)
     session_id = state.get("session_id", "")
     answer = ""
     if is_stream:
+        delta_buffer = []
+        buffer_chars = 0
+
+        def flush_delta_buffer():
+            nonlocal delta_buffer, buffer_chars
+            if not delta_buffer:
+                return
+            push_to_session(session_id, SSEEvent.DELTA, {"delta": "".join(delta_buffer)})
+            delta_buffer = []
+            buffer_chars = 0
+
         for chunk in llm_client.stream(prompt_template):
             delta = chunk.content
             answer += delta
             if delta:
-                push_to_session(session_id, SSEEvent.DELTA, {"delta": delta})
+                delta_buffer.append(delta)
+                buffer_chars += len(delta)
+                if buffer_chars >= 120 or delta.endswith(("\n", "。", "！", "？", ".", "!", "?")):
+                    flush_delta_buffer()
+        flush_delta_buffer()
+        answer = normalize_answer_markdown(answer)
+        set_task_result(session_id, "answer", answer)
     else:
         response = llm_client.invoke(prompt_template)
-        answer = response.content
+        answer = normalize_answer_markdown(response.content)
         set_task_result(session_id, "answer", answer)
     state["answer"] = answer
     return answer
@@ -180,13 +313,18 @@ def node_answer_output(state: QueryGraphState) -> QueryGraphState:
         answer = step3_generate_answer(state, prompt_template)
         # 4. 提取url
         image_urls = step4_extract_image_urls(state)
-        # 5. 返回图片
-        if image_urls:
+        # 5. 返回最终答案；即使没有图片，也用最终事件覆盖流式过程中的未格式化片段。
+        if is_stream:
             push_to_session(session_id, SSEEvent.FINAL,
                              {"answer": answer, "status": "completed", "image_urls": image_urls})
         # 6. 保存到MongoDB
         save_chat_message(session_id=session_id, role="assistant", text=answer,
-                          rewritten_query=state.get("rewritten_query", ""), item_names=state.get("item_names", []), image_urls=image_urls)
+                          rewritten_query=state.get("rewritten_query", ""),
+                          item_names=state.get("item_names", []),
+                          image_urls=image_urls,
+                          course_id=state.get("course_id", ""),
+                          course_name=state.get("course_name", ""),
+                          mode=state.get("mode", "qa"))
     add_done_task(session_id, function_name, is_stream)
     return state
 

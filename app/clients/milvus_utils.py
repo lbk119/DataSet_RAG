@@ -1,5 +1,4 @@
 import os
-from pymilvus import MilvusClient, AnnSearchRequest, WeightedRanker
 from app.conf.milvus_config import milvus_config
 from app.core.logger import logger
 
@@ -16,6 +15,10 @@ def get_milvus_client():
         global _milvus_client
         # 单例判断：未初始化则创建新连接
         if _milvus_client is None:
+            print("[Milvus] importing pymilvus.MilvusClient...", flush=True)
+            from pymilvus import MilvusClient
+            print("[Milvus] pymilvus imported, creating client...", flush=True)
+
             milvus_uri = milvus_config.milvus_url
             # 校验Milvus连接地址配置
             if not milvus_uri:
@@ -23,6 +26,7 @@ def get_milvus_client():
                 return None
             # 初始化Milvus客户端
             _milvus_client = MilvusClient(uri=milvus_uri)
+            print("[Milvus] client created", flush=True)
             logger.info("Milvus客户端连接成功")
         return _milvus_client
     except Exception as e:
@@ -134,6 +138,8 @@ def create_hybrid_search_requests(dense_vector, sparse_vector, dense_params=None
         sparse_params = {"metric_type": "IP"}
 
     # 构建稠密向量搜索请求，关联Milvus的dense_vector字段 近似最近邻（ANN）检索请求的核心类
+    from pymilvus import AnnSearchRequest
+
     dense_req = AnnSearchRequest(
         data=[dense_vector],
         anns_field="dense_vector",
@@ -170,6 +176,8 @@ def hybrid_search(client, collection_name, reqs, ranker_weights=(0.5, 0.5), norm
     :return: 混合搜索结果列表，搜索失败返回None
     """
     try:
+        from pymilvus import WeightedRanker
+
         # 初始化加权排名器：按权重融合稠密/稀疏向量的搜索结果
         # norm_score=True：先将两个向量评分归一化到0~1区间，再加权计算
         rerank = WeightedRanker(ranker_weights[0], ranker_weights[1], norm_score=norm_score)

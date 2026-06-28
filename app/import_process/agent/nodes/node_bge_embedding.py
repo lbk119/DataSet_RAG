@@ -34,7 +34,10 @@ def step3_generate_embeddings(model, chunks: List[Dict[str, Any]]) -> List[Dict[
         batch = chunks[i:i+batch_size]
         try:
             # 文本拼接：item_name + , + content
-            texts = [f"商品：{chunk.get('item_name','')},介绍：{chunk.get('content','')}" for chunk in batch]
+            texts = [
+                f"课程：{chunk.get('course_name','')},资料类型：{chunk.get('material_type','')},主题：{chunk.get('item_name','')},内容：{chunk.get('content','')}"
+                for chunk in batch
+            ]
             # 批量生成双向量
             vectors = generate_embeddings(texts)
             # 向量绑定：为每个切片新增dense_vector/sparse_vector字段

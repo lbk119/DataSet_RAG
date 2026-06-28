@@ -13,7 +13,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(project_root))
 
 # 第三方库
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 # 项目内部工具/配置/客户端
@@ -31,6 +31,7 @@ from app.import_process.agent.state import get_default_state
 from app.import_process.agent.main_graph import import_graph # LangGraph全流程编译实例
 from app.core.logger import logger # 项目统一日志工具
 from app.conf.minio_config import minio_config # MinIO配置对象实例
+from app.clients.course_utils import course_response, ensure_course
 
 app = FastAPI(title="知识库导入服务", description="基于LangGraph的知识库导入API", version="1.0.0")
 # 跨域中间件配置：解决前端调用后端接口的跨域限制
@@ -56,7 +57,14 @@ async def get_import_page():
 
 # 后台任务：LangGraph全流程执行
 # 独立于主请求线程，由BackgroundTasks触发，避免阻塞接口响应
-def run_graph_task(task_id: str,local_dir: str, local_file_path: str):
+def run_graph_task(
+        task_id: str,
+        local_dir: str,
+        local_file_path: str,
+        course_id: str = "",
+        course_name: str = "",
+        material_type: str = "other",
+):
     """
     后台任务函数：执行LangGraph全流程。
     核心流程：初始化状态 → 流式执行图节点 → 实时更新任务状态 → 异常捕获
@@ -74,6 +82,9 @@ def run_graph_task(task_id: str,local_dir: str, local_file_path: str):
         # 2. 初始化LangGraph状态：加载默认状态 + 注入当前任务的核心参数
         state = get_default_state() # 获取默认状态实例
         state["task_id"] = task_id # 注入任务ID
+        state["course_id"] = course_id
+        state["course_name"] = course_name
+        state["material_type"] = material_type
         state["local_dir"] = local_dir # 注入工作目录（中间文件输出目录）
         state["local_file_path"] = local_file_path # 注入输入文件路径
         # 3. 流式执行LangGraph全流程（stream模式：实时获取每个节点的执行结果）
@@ -90,8 +101,25 @@ def run_graph_task(task_id: str,local_dir: str, local_file_path: str):
         update_task_status(task_id, "failed") # 更新任务状态为失败
         logger.error(f"任务 {task_id} 执行失败，错误信息: {str(e)}")
 
+@app.get("/courses")
+async def list_courses_api():
+    return course_response()
+
+
+@app.post("/courses")
+async def create_course_api(course_name: str = Form(...)):
+    course = ensure_course(course_name=course_name)
+    return {"code": 200, "course": course}
+
+
 @app.post("/upload",summary="上传文件并触发导入流程",description="接收用户上传的多文件，保存到服务器，并触发后台任务执行LangGraph全流程。")
-async def upload_file(files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = None):
+async def upload_file(
+        files: List[UploadFile] = File(...),
+        background_tasks: BackgroundTasks = None,
+        course_id: str = Form(None),
+        course_name: str = Form(None),
+        material_type: str = Form("other"),
+):
     """
     文件上传核心接口
     1. 接收前端上传的多文件（PDF/MD为主）
@@ -105,7 +133,11 @@ async def upload_file(files: List[UploadFile] = File(...), background_tasks: Bac
     """
     # 1. 构建本地存储根目录：项目根目录/output/YYYYMMDD（按日期分层，方便管理）
     date_str = datetime.now().strftime("%Y%m%d")
-    date_dir = os.path.join(PROJECT_ROOT, "output", date_str)
+    course = ensure_course(course_id=course_id, course_name=course_name)
+    course_id = course["course_id"]
+    course_name = course["course_name"]
+    material_type = material_type or "other"
+    date_dir = os.path.join(PROJECT_ROOT, "output", "courses", course_id, date_str)
     os.makedirs(date_dir, exist_ok=True)
     # 2. 遍历处理每个上传的文件（多文件批量处理，各自独立生成TaskID）
     task_ids = [] # 存储所有生成的任务ID，供前端展示
@@ -127,18 +159,18 @@ async def upload_file(files: List[UploadFile] = File(...), background_tasks: Bac
         try:
             minio_client = get_minio_client() # 获取MinIO客户端实例
             bucket_name = minio_config.bucket_name # 从配置获取桶名称
-            object_name = f"{bucket_name}/{date_str}/{upload_file.filename}" # 构建对象名称，按日期分层
+            object_name = f"courses/{course_id}/{date_str}/{upload_file.filename}" # 构建对象名称，按课程/日期分层
             minio_client.fput_object(bucket_name=bucket_name, object_name=object_name, file_path=local_file_path,content_type=upload_file.content_type)
             logger.info(f"文件 {upload_file.filename} 已上传到MinIO，桶: {bucket_name}, 对象: {object_name}")
         except Exception as e:
             logger.error(f"文件 {upload_file.filename} 上传到MinIO失败，错误信息: {str(e)}")
         # 7. 启动后台任务执行LangGraph全流程，传入必要参数（TaskID、文件路径等）
         add_done_task(task_id, "upload_file") # 标记「文件上传」阶段完成
-        background_tasks.add_task(run_graph_task, task_id, local_dir, local_file_path) # 添加后台任务
+        background_tasks.add_task(run_graph_task, task_id, local_dir, local_file_path, course_id, course_name, material_type) # 添加后台任务
         logger.info(f"任务 {task_id} 已启动后台处理，文件路径: {local_file_path}")
     # 8. 返回响应：包含所有生成的TaskID，供前端展示和后续查询使用
     logger.info(f"多文件上传处理完毕，共处理{len(files)}个文件，生成TaskID列表：{task_ids}")
-    return {"code": 200,"message": f"Files uploaded successfully, total: {len(files)}","task_ids": task_ids}
+    return {"code": 200,"message": f"Files uploaded successfully, total: {len(files)}","task_ids": task_ids, "course": course}
 
 @app.get("/status/{task_id}", summary="任务状态查询", description="根据TaskID查询单个文件的处理进度和全局状态")
 async def get_task_progress(task_id: str):

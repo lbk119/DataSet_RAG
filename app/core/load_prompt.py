@@ -2,6 +2,19 @@ from pathlib import Path
 from app.utils.path_util import PROJECT_ROOT
 from app.core.logger import logger  # 可选，加日志更友好
 
+def render_prompt_variables(raw_prompt: str, **kwargs) -> str:
+    """
+    只替换业务传入的占位符，避免 LaTeX 中的 {cases}、{align*} 等被 str.format 误识别。
+    当前提示词只使用 {key} 和 {key[index]} 两种形式。
+    """
+    rendered = raw_prompt
+    for key, value in kwargs.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                rendered = rendered.replace("{" + key + f"[{index}]" + "}", str(item))
+    return rendered
+
 def load_prompt(name: str, **kwargs) -> str:
     """
     加载提示词并渲染变量占位符
@@ -21,7 +34,7 @@ def load_prompt(name: str, **kwargs) -> str:
 
     # 4. 核心：如果传了参数，渲染占位符；没传参，直接返回原文本
     if kwargs:
-        rendered_prompt = raw_prompt.format(**kwargs)
+        rendered_prompt = render_prompt_variables(raw_prompt, **kwargs)
         logger.debug(f"提示词渲染成功，替换变量：{list(kwargs.keys())}")
         return rendered_prompt
     return raw_prompt

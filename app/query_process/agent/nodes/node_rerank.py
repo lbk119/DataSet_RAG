@@ -7,15 +7,14 @@ if __package__ in {None, ""}:
     if repo_root_str not in sys.path:
         sys.path.insert(0, repo_root_str)
 
-from app.utils.task_utils import *
 from dotenv import load_dotenv
-from app.clients.reranker_utils import get_reranker_model
 from app.utils.task_utils import add_running_task, add_done_task
 from app.core.logger import logger
 load_dotenv()
 
 # 动态 TopK 硬上限：最多取前 N 条（< 10）
 RERANK_MAX_TOPK: int = 10
+EXAM_RERANK_MAX_TOPK: int = 24
 # 最小 TopK：至少保留前 N 条（> 1，且 < RERANK_MAX_TOPK）
 RERANK_MIN_TOPK: int = 1
 # 断崖阈值（相对）
@@ -57,7 +56,9 @@ def step1_merge_docs(state) -> list:
         standardized_docs.append({
             "text": chunk["entity"]["content"],
             "chunk_id": chunk["entity"]["chunk_id"],
-            "title": chunk["entity"].get("item_name", ""),
+            "title": chunk["entity"].get("file_title") or chunk["entity"].get("item_name", ""),
+            "material_type": chunk["entity"].get("material_type", ""),
+            "course_name": chunk["entity"].get("course_name", ""),
             "url": "",
             "source": "local"
         })
@@ -68,6 +69,8 @@ def step1_merge_docs(state) -> list:
             "text": doc["snippet"],
             "chunk_id": "",
             "title": doc.get("title", ""),
+            "material_type": "web",
+            "course_name": "",
             "url": doc.get("url", ""),
             "source": "web"
         })
@@ -84,9 +87,12 @@ def step2_rerank_docs(state, docs) -> list:
     - scored_docs (List[Dict]): 每个文档附加一个 "score" 字段，表示与用户查询的相关性得分。
     """
     # 1. 获取 Reranker 模型
+    from app.clients.reranker_utils import get_reranker_model
     reranker = get_reranker_model()
     # 2. 获取用户查询问题
     query = state.get("rewritten_query", "")
+    if state.get("mode") == "exam":
+        query = f"{query}\n重点参考往年试卷、期中期末试卷、考试题型、复习范围。"
     # 3. 获取文档文本并进行打分
     texts = [doc["text"] for doc in docs]
     query_texts = [(query, text) for text in texts]
@@ -123,6 +129,16 @@ def step3_dynamic_topk(scored_docs) -> list:
                 break
     return scored_docs[:max_topk]
 
+def step4_select_exam_docs(scored_docs) -> list:
+    """
+    出卷模式下，往年试卷结构比普通语义相关性更重要：
+    先保留试卷切片，再补充少量课件/教材作为命题内容依据。
+    """
+    exam_docs = [doc for doc in scored_docs if doc.get("material_type") == "exam"]
+    support_docs = [doc for doc in scored_docs if doc.get("material_type") != "exam"]
+    selected = exam_docs[:18] + support_docs[:6]
+    return selected[:EXAM_RERANK_MAX_TOPK]
+
 def node_rerank(state):
     """
     对rrf筛选后的文档和网络检索到的文档进行打分排序
@@ -132,10 +148,26 @@ def node_rerank(state):
     logger.info(f"- {function_name} - 开始执行")
     # 阶段一：合并文档
     docs_to_rerank = step1_merge_docs(state)
+    if not docs_to_rerank:
+        state["reranked_docs"] = []
+        add_done_task(state["session_id"], function_name, state.get("is_stream", False))
+        return {
+            "reranked_docs": []
+        }
     # 阶段二：对文档进行重排序
-    scored_docs = step2_rerank_docs(state, docs_to_rerank)
+    try:
+        scored_docs = step2_rerank_docs(state, docs_to_rerank)
+    except Exception as e:
+        logger.error(f"- {function_name} - Reranker执行失败，回退使用召回顺序: {e}", exc_info=True)
+        for index, doc in enumerate(docs_to_rerank):
+            doc["score"] = max(0.0, 1.0 - index * 0.01)
+        state["reranked_docs"] = step4_select_exam_docs(docs_to_rerank) if state.get("mode") == "exam" else docs_to_rerank[:RERANK_MAX_TOPK]
+        add_done_task(state["session_id"], function_name, state.get("is_stream", False))
+        return {
+            "reranked_docs": state["reranked_docs"]
+        }
     # 阶段三：动态 TopK（防断崖）
-    reranked_docs = step3_dynamic_topk(scored_docs)
+    reranked_docs = step4_select_exam_docs(scored_docs) if state.get("mode") == "exam" else step3_dynamic_topk(scored_docs)
     state["reranked_docs"] = reranked_docs
     add_done_task(state["session_id"], function_name, state.get("is_stream", False))
     return {

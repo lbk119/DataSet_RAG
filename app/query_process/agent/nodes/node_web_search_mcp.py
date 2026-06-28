@@ -50,6 +50,12 @@ def node_web_search_mcp(state):
     function_name = sys._getframe().f_code.co_name
     add_running_task(state["session_id"], function_name, state.get("is_stream", False))
     logger.info(f"- {function_name} - 开始执行")
+    if state.get("course_id"):
+        logger.info(f"- {function_name} - 课程模式跳过联网搜索，优先使用课程知识库")
+        add_done_task(state["session_id"], function_name, state.get("is_stream", False))
+        return {
+            "web_search_docs": []
+        }
     query = state.get("rewritten_query", "")
     try:
         response = asyncio.run(call_mcp_streamable(query))

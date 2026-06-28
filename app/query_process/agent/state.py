@@ -5,10 +5,15 @@ class QueryGraphState(TypedDict):
     QueryGraphState 定义了整个查询流程中流转的数据结构。
     """
     session_id: str # 会话唯一标识
+    course_id: str
+    course_name: str
+    mode: str
     original_query: str # 用户原始问题
+    attachment_context: str # 查询侧临时上传附件解析结果
     # 检索过程中的中间数据
     embedding_chunks: list # 普通向量检索回来的切片
     hyde_embedding_chunks: list # HyDE 检索回来的切片
+    exam_chunks: list # 出卷模式下额外召回的往年试卷切片
     kg_chunks: list # 图谱检索回来的切片
     web_search_docs: list # 网络搜索回来的文档
     # 排序过程中的数据

@@ -233,6 +233,10 @@ def node_document_split(state: ImportGraphState) -> ImportGraphState:
             sections = [{"title": "无标题", "content": content, "file_title": file_title}]
         # 4. 长切短合处理：对初切后的Chunk列表进行长度检查，超过max_content_length的Chunk会被进一步切分；同时对同父标题的短Chunk进行合并，减少碎片化
         processed_chunks = step4_split_and_merge(sections, DEFAULT_MAX_CONTENT_LENGTH,MIN_CONTENT_LENGTH)
+        for chunk in processed_chunks:
+            chunk["course_id"] = state.get("course_id", "")
+            chunk["course_name"] = state.get("course_name", "")
+            chunk["material_type"] = state.get("material_type", "other")
         # 5. 结果备份：将处理后的Chunk列表存储到状态字典中，便于后续节点使用
         state["chunks"] = processed_chunks
         step5_backup_results(state, processed_chunks)

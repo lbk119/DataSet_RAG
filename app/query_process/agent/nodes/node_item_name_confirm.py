@@ -15,13 +15,31 @@ from app.core.load_prompt import load_prompt
 from app.query_process.agent.state import QueryGraphState
 from app.utils.task_utils import add_running_task, add_done_task
 from app.clients.mongo_history_utils import get_recent_messages,save_chat_message, update_message_item_names
-from app.lm.lm_utils import get_llm_client
-from app.lm.embedding_utils import generate_embeddings
 from app.clients.milvus_utils import get_milvus_client,create_hybrid_search_requests, hybrid_search
 from dotenv import load_dotenv,find_dotenv
 from app.core.logger import logger
 from app.conf.milvus_config import milvus_config
 load_dotenv(find_dotenv())
+
+
+def _course_item_names(state) -> List[str]:
+    course_id = state.get("course_id", "")
+    course_name = state.get("course_name", "")
+    names = []
+    for name in [course_id, course_name]:
+        if name and name not in names:
+            names.append(name)
+    return names
+
+def _needs_course_rewrite(query: str) -> bool:
+    text = (query or "").strip()
+    if not text:
+        return False
+    rewrite_markers = [
+        "它", "这个", "这道", "这题", "上面", "刚才", "前面", "上一题",
+        "这里", "这一步", "该题", "该方法", "继续", "再问一下", "那个",
+    ]
+    return any(marker in text for marker in rewrite_markers)
 
 def step2_extract_info(query: str, history_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -36,6 +54,8 @@ def step2_extract_info(query: str, history_messages: List[Dict[str, Any]]) -> Di
     }
     """
     # 1. 初始化准备：获取LLM客户端，拼接历史会话为文本格式，加载并拼接提示词，构造LLM调用的消息列表
+    from app.lm.lm_utils import get_llm_client
+
     llm_client = get_llm_client(json_mode=True)  # 获取LLM客户端，开启JSON输出模式
     history_text = "\n".join([f"{msg['role']}: {msg['text']}" for msg in history_messages])  # 将历史消息拼接为文本
     prompt_template = load_prompt("rewritten_query_and_itemnames", history_text=history_text, query=query)  # 加载提取信息的提示词模板
@@ -60,6 +80,40 @@ def step2_extract_info(query: str, history_messages: List[Dict[str, Any]]) -> Di
     if "rewritten_query" not in result:
         result["rewritten_query"] = query
     return result
+
+def step2_rewrite_course_query(query: str, history_messages: List[Dict[str, Any]], course_name: str = "") -> str:
+    """
+    课程模式只做上下文指代消解和问题重写，不做商品名抽取。
+    如果 LLM 调用失败或返回异常，直接返回原问题，保证后续检索不会被阻塞。
+    """
+    if not history_messages or not _needs_course_rewrite(query):
+        return query
+
+    try:
+        from app.lm.lm_utils import get_llm_client
+
+        llm_client = get_llm_client(json_mode=True)
+        history_text = "\n".join([f"{msg.get('role', '')}: {msg.get('text', '')}" for msg in history_messages[-8:]])
+        prompt_template = load_prompt(
+            "course_query_rewrite",
+            history_text=history_text,
+            course_name=course_name or "",
+            query=query,
+        )
+        messages = [
+            SystemMessage(content="你是大学课程助教，负责把有上下文依赖的问题改写成独立完整的问题。"),
+            HumanMessage(content=prompt_template),
+        ]
+        response = llm_client.invoke(messages)
+        response_content = response.content.strip()
+        if response_content.startswith("```json"):
+            response_content = response_content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(response_content)
+        rewritten_query = (result.get("rewritten_query") or "").strip()
+        return rewritten_query or query
+    except Exception as e:
+        logger.warning(f"课程问题重写失败，使用原问题继续检索: {e}")
+        return query
 
 def step3_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
     """
@@ -89,6 +143,7 @@ def step3_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
         return results  # 无法连接数据库则返回空结果
     collection_name = milvus_config.item_name_collection  # 从配置获取集合名称
     # 对所有商品名称批量生成BGEM3向量（稠密+稀疏），相比逐个生成提升处理效率
+    from app.lm.embedding_utils import generate_embeddings
     embeddings = generate_embeddings(item_names) 
     for i in range(len(item_names)):
         item_result = {"extracted_name": item_names[i], "matches": []}  # 初始化当前商品名的结果结构
@@ -225,10 +280,38 @@ def node_item_name_confirm(state):
     func_name = sys._getframe().f_code.co_name
     session_id = state["session_id"]
     is_stream = state.get("is_stream", True)
+    if state.get("course_id"):
+        print(f"[node_item_name_confirm] course mode enter session={session_id}", flush=True)
+        add_running_task(session_id, func_name, is_stream)
+        print(f"[node_item_name_confirm] loading history session={session_id}", flush=True)
+        history_messages = get_recent_messages(session_id, limit=10, course_id=state.get("course_id"))
+        print(f"[node_item_name_confirm] history loaded count={len(history_messages or [])}, need_rewrite={_needs_course_rewrite(state.get('original_query', ''))}", flush=True)
+        state["history"] = history_messages
+        print(f"[node_item_name_confirm] saving user message session={session_id}", flush=True)
+        message_id = save_chat_message(
+            session_id=session_id,
+            role="user",
+            text=state["original_query"],
+            item_names=_course_item_names(state),
+            course_id=state.get("course_id", ""),
+            course_name=state.get("course_name", ""),
+            mode=state.get("mode", "qa"),
+        )
+        print(f"[node_item_name_confirm] user message saved session={session_id}", flush=True)
+        state["rewritten_query"] = step2_rewrite_course_query(
+            state["original_query"],
+            history_messages,
+            state.get("course_name", ""),
+        )
+        state["item_names"] = _course_item_names(state)
+        add_done_task(session_id, func_name, is_stream)
+        logger.info(f"- {func_name}- 课程模式处理完成，课程: {state.get('course_name', '')}, 改写问题: {state.get('rewritten_query', '')}")
+        return state
     print(f"- {func_name}- 处理开始")
     add_running_task(session_id, func_name, is_stream)
     # 1. 获取历史记录,保存用户当前问题
     history_messages = get_recent_messages(session_id, limit=10)
+    state["history"] = history_messages
     message_id = save_chat_message(session_id=session_id, role="user", text=state["original_query"],item_names=state.get("item_names", [])) 
     # 2. 调用LLM提取商品名称和改写问题
     extracted_info = step2_extract_info(state["original_query"], history_messages)
