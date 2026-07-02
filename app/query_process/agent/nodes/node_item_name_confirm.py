@@ -41,6 +41,44 @@ def _needs_course_rewrite(query: str) -> bool:
     ]
     return any(marker in text for marker in rewrite_markers)
 
+
+COURSE_QUERY_EXPANSIONS = {
+    "牛顿插值": ["差商", "承袭性", "插值多项式", "插值余项"],
+    "拉格朗日插值": ["插值基函数", "插值多项式", "唯一性"],
+    "Hermite": ["埃尔米特插值", "导数值", "节点重数", "插值余项"],
+    "埃尔米特": ["Hermite", "导数值", "节点重数", "插值余项"],
+    "最小二乘": ["正规方程", "正交条件", "平方逼近", "残差"],
+    "数值积分": ["梯形公式", "Simpson", "复化求积", "误差"],
+    "Simpson": ["辛普森公式", "复化公式", "偶数子区间", "代数精度"],
+    "梯形公式": ["复化梯形", "步长", "误差"],
+    "数值微分": ["差商", "截断误差", "舍入误差", "步长"],
+    "Jacobi": ["迭代矩阵", "谱半径", "收敛条件", "严格对角占优"],
+    "Gauss-Seidel": ["迭代矩阵", "谱半径", "收敛条件", "严格对角占优"],
+    "严格对角占优": ["迭代收敛", "Jacobi", "Gauss-Seidel", "充分条件"],
+    "二分法": ["方程求根", "异号区间", "收敛速度"],
+    "牛顿法": ["方程求根", "迭代公式", "导数", "收敛性"],
+    "弦截法": ["割线法", "差商", "牛顿法", "超线性收敛"],
+    "不动点迭代": ["压缩映射", "收敛条件", "phi", "迭代格式"],
+    "Euler": ["欧拉方法", "常微分方程", "初值问题", "局部截断误差"],
+    "Runge-Kutta": ["龙格库塔", "四阶", "常微分方程", "初值问题"],
+}
+
+
+def expand_course_query_keywords(query: str) -> str:
+    text = (query or "").strip()
+    if not text:
+        return text
+    additions = []
+    lowered = text.lower()
+    for key, keywords in COURSE_QUERY_EXPANSIONS.items():
+        if key.lower() in lowered:
+            for keyword in keywords:
+                if keyword.lower() not in lowered and keyword not in additions:
+                    additions.append(keyword)
+    if not additions:
+        return text
+    return f"{text}（检索关键词：{'、'.join(additions[:8])}）"
+
 def step2_extract_info(query: str, history_messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     利用LLM从当前问题以及历史会话中提取出主要询问的商品名称item_names（可多个，JSON列表形式）
@@ -87,7 +125,7 @@ def step2_rewrite_course_query(query: str, history_messages: List[Dict[str, Any]
     如果 LLM 调用失败或返回异常，直接返回原问题，保证后续检索不会被阻塞。
     """
     if not history_messages or not _needs_course_rewrite(query):
-        return query
+        return expand_course_query_keywords(query)
 
     try:
         from app.lm.lm_utils import get_llm_client
@@ -110,10 +148,10 @@ def step2_rewrite_course_query(query: str, history_messages: List[Dict[str, Any]
             response_content = response_content.replace("```json", "").replace("```", "").strip()
         result = json.loads(response_content)
         rewritten_query = (result.get("rewritten_query") or "").strip()
-        return rewritten_query or query
+        return expand_course_query_keywords(rewritten_query or query)
     except Exception as e:
         logger.warning(f"课程问题重写失败，使用原问题继续检索: {e}")
-        return query
+        return expand_course_query_keywords(query)
 
 def step3_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
     """

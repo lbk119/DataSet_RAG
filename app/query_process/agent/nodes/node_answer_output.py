@@ -13,10 +13,12 @@ from app.query_process.agent.state import QueryGraphState
 from app.core.logger import logger
 from app.core.load_prompt import load_prompt
 from app.clients.mongo_history_utils import save_chat_message
+from app.query_process.utils.exam_structure_analyzer import analyze_exam_structure
 import re
 _IMAGE_BLOCK_MARKER = "【图片】"
 MAX_CONTEXT_CHARS = 12000
-MAX_EXAM_CONTEXT_CHARS = 30000
+MAX_EXAM_CONTEXT_CHARS = 18000
+MAX_EXAM_DOC_CHARS = 1800
 
 MATH_ENV_PATTERN = re.compile(
     r"^\s*\\begin\{(cases|aligned|align\*?|array|matrix|pmatrix|bmatrix|vmatrix|equation\*?|split|gather\*?)\}"
@@ -102,6 +104,67 @@ def normalize_answer_markdown(answer: str) -> str:
 
     return "\n".join(out)
 
+
+def _format_exam_doc_metadata(doc: dict) -> str:
+    parts = []
+    for label, key in [
+        ("年份", "exam_year"),
+        ("题号", "exam_question_no"),
+        ("题型", "exam_question_type"),
+        ("分值", "exam_score"),
+        ("考点", "exam_topics"),
+    ]:
+        value = doc.get(key)
+        if value not in (None, "", 0, False):
+            parts.append(f"{label}: {value}")
+    if doc.get("is_reference_answer"):
+        parts.append("资料类型: 参考答案/解析")
+    return "；".join(parts)
+
+
+def _truncate_doc_text(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...[已截断]"
+
+
+def step_generate_exam_blueprint(state: QueryGraphState, exam_structure: str, exam_docs: list[str], support_docs: list[str]) -> str:
+    from app.lm.lm_utils import get_llm_client
+
+    question = state.get("rewritten_query", "") or state.get("original_query", "")
+    course_name = state.get("course_name", "")
+    compact_exam_context = "\n".join(exam_docs[:8])
+    compact_support_context = "\n".join(support_docs[:3])
+    prompt = f"""
+你是大学专业课助教。请先只做“出卷结构蓝图”，不要生成完整试卷。
+
+课程：{course_name}
+用户需求：{question}
+
+{exam_structure}
+
+【往年试卷证据摘录】
+{compact_exam_context or "未检索到往年试卷摘录"}
+
+【补充课程资料摘录】
+{compact_support_context or "无"}
+
+请输出：
+1. 推荐大题数量。
+2. 每个大题的位置、题型、建议分值、常考方向、今年预测方向。
+3. 哪些判断依据较强，哪些依据不足。
+要求：控制在 900 字以内，只给蓝图，不要写完整题目和答案。
+""".strip()
+    try:
+        response = get_llm_client().invoke(prompt)
+        blueprint = (response.content or "").strip()
+    except Exception as e:
+        logger.error(f"出卷结构蓝图生成失败，回退使用确定性结构分析: {e}", exc_info=True)
+        blueprint = exam_structure
+    state["exam_blueprint"] = blueprint
+    return blueprint
+
 def step1_check_existing_answer(state: QueryGraphState) -> bool:
     """
     判断state中是否已有答案
@@ -147,7 +210,13 @@ def step2_load_prompt(state: QueryGraphState) -> str:
         source = doc.get("source", "")
         material_type = doc.get("material_type", "")
         score = doc.get("score", 0.0)
-        content = f"Document {i} (Source: {source}, Type: {material_type}, Title: {title}, Score: {score}): {text}\n"
+        if mode == "exam":
+            meta = _format_exam_doc_metadata(doc)
+            text = _truncate_doc_text(text, MAX_EXAM_DOC_CHARS if material_type == "exam" else 900)
+            meta_suffix = f", Metadata: {meta}" if meta else ""
+            content = f"Document {i} (Source: {source}, Type: {material_type}, Title: {title}, Score: {score}{meta_suffix}): {text}\n"
+        else:
+            content = f"Document {i} (Source: {source}, Type: {material_type}, Title: {title}, Score: {score}): {text}\n"
         if used_length + len(content) > max_context_chars:
             logger.info(f"文档内容超过最大限制，已截断。当前已使用字符数: {used_length}, 新文档字符数: {len(content)}, 最大限制: {max_context_chars}")
             break
@@ -159,8 +228,13 @@ def step2_load_prompt(state: QueryGraphState) -> str:
             docs.append(content)
         used_length += len(content)
     if mode == "exam":
+        exam_structure = analyze_exam_structure(reranked_docs)
+        exam_blueprint = step_generate_exam_blueprint(state, exam_structure, exam_docs, support_docs)
         context = (
-            "【往年试卷结构依据】\n"
+            exam_structure
+            + "\n\n【出卷结构蓝图（第一步生成结果）】\n"
+            + exam_blueprint
+            + "\n\n【往年试卷原始切片依据】\n"
             + ("\n".join(exam_docs) if exam_docs else "未检索到 material_type=exam 的往年试卷切片，请降低结构确定性并说明依据不足。")
             + "\n\n【补充课程资料】\n"
             + ("\n".join(support_docs) if support_docs else "无补充课程资料。")

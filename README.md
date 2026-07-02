@@ -17,6 +17,7 @@ DataSet_RAG 是一个面向大学专业课学习的 RAG 知识库助手。你可
 - RRF 融合与重排序：融合多路召回结果，并使用 reranker 重新排序。
 - 专业课答疑：根据当前课程知识库和历史会话回答问题。
 - 模拟试卷生成：出卷模式会优先参考导入的往年试卷结构和题型，例如保持相近的大题数量、题型分布和考点方向。
+- 出卷结构分析：生成试卷前会先对往年试卷切片做确定性结构统计，提取常见大题数量、题型、分值和高频考点，再将分析结果注入出卷 Prompt。
 - 多模态输入：查询页支持点击上传、拖拽上传、粘贴截图/图片/文件，并将附件解析结果加入本轮回答上下文。
 - 流式输出：查询页使用 SSE 流式展示生成过程，最终答案再进行 Markdown 与公式渲染。
 - 历史记录：对话历史保存到 MongoDB，并按课程加载。
@@ -151,7 +152,41 @@ python -m venv .venv
 pip install -e .
 ```
 
+复制环境变量模板：
+
+```powershell
+copy .env.example .env
+```
+
+然后按本机服务地址、模型名称和密钥补全 `.env`。
+
+## 健康检查
+
+运行基础环境检查：
+
+```powershell
+uv run python scripts/health_check.py
+```
+
+如果导入服务和查询服务已经启动，也可以检查 HTTP 接口：
+
+```powershell
+uv run python scripts/health_check.py --services
+```
+
 ## 启动
+
+Windows 下一键启动两个 FastAPI 服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/dev_start.ps1
+```
+
+如果只想启动服务、不运行健康检查：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/dev_start.ps1 -SkipCheck
+```
 
 启动导入服务：
 
@@ -242,6 +277,66 @@ DELETE /history/{session_id}
 }
 ```
 
+## RAG 效果评测
+
+项目提供 `evals/` 下的评测脚本，用于从功能测试升级到 RAG 效果测试。
+
+示例资料目录：
+
+```text
+evals/sample_docs/
+```
+
+导入示例 PDF 到“计算方法”课程：
+
+```powershell
+uv run python evals/import_sample_docs.py --course-name 计算方法
+```
+
+运行 RAG 链路评测样本，保存答案、上下文和每步中间结果：
+
+```powershell
+uv run python evals/run_rag_eval.py
+```
+
+运行自定义链路指标：
+
+```powershell
+uv run python evals/custom_metrics.py
+```
+
+运行 Ragas 指标：
+
+```powershell
+uv run python evals/ragas_eval.py
+```
+
+汇总所有评测结果，生成整体报告：
+
+```powershell
+uv run python evals/summarize_eval.py
+```
+
+默认输出：
+
+```text
+evals/reports/rag_outputs.jsonl
+evals/reports/custom_metrics.json
+evals/reports/ragas_report.csv
+evals/reports/eval_summary.json
+evals/reports/eval_summary.md
+```
+
+主要关注：
+
+- `faithfulness`：答案是否忠实于检索上下文。
+- `answer_relevancy`：答案是否回答了用户问题。
+- `context_precision`：TopK 上下文是否有用。
+- `context_recall`：参考答案需要的信息是否被召回。
+- `expected_material_hit_at_5`：前 5 个重排结果是否命中预期资料类型。
+- `course_leak_rate`：是否检索到其他课程资料。
+- `exam_context_ratio`：出卷相关问题中，试卷资料占上下文比例。
+
 ## 数据隔离
 
 课程隔离依赖 `course_id`：
@@ -296,7 +391,8 @@ DELETE /history/{session_id}
 ## 开发提示
 
 - 新增资料类型时，需要同步前端 `material_type`、入库字段和出卷 Prompt。
-- 如果希望考试预测更稳定，可以在检索和重排阶段提高 `material_type == "exam"` 的权重。
+- 如果希望考试预测更稳定，可以继续扩展 `app/query_process/utils/exam_structure_analyzer.py`，提取年份、分值、题型顺序、章节考频等更细结构。
+- 如果希望部署更省心，可以把 MongoDB、Milvus、MinIO 编排到 Docker Compose，并让 `scripts/health_check.py` 检查容器状态。
 - 如果需要多用户系统，可以将 `output/courses.json` 迁移到 MongoDB，并在 Milvus、MongoDB、MinIO 路径中增加 `user_id`。
 
 ## 许可证

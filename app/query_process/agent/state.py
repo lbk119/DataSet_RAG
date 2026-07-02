@@ -14,6 +14,8 @@ class QueryGraphState(TypedDict):
     embedding_chunks: list # 普通向量检索回来的切片
     hyde_embedding_chunks: list # HyDE 检索回来的切片
     exam_chunks: list # 出卷模式下额外召回的往年试卷切片
+    exam_semantic_chunks: list # 出卷模式下按问题语义召回的试卷切片
+    preferred_material_chunks: list # 按问题意图优先召回的资料类型切片
     kg_chunks: list # 图谱检索回来的切片
     web_search_docs: list # 网络搜索回来的文档
     # 排序过程中的数据
@@ -21,9 +23,12 @@ class QueryGraphState(TypedDict):
     reranked_docs: list # 重排序后的最终 Top-K 文档
     # 生成过程中的数据
     prompt: str # 组装好的 Prompt
+    exam_blueprint: str # 出卷模式第一步生成的结构蓝图
     answer: str # 最终生成的答案
     # 辅助信息
     item_names: List[str] # 提取出的商品名称
     rewritten_query: str # 改写后的问题
+    query_intent: str # 查询意图：concept/problem/exam
+    preferred_material_types: list # 当前查询优先使用的资料类型
     history: list # 历史对话记录
     is_stream: bool # 是否流式输出标记

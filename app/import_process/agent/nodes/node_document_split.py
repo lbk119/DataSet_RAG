@@ -24,6 +24,129 @@ from app.core.logger import logger # 项目统一日志工具，核心替换prin
 DEFAULT_MAX_CONTENT_LENGTH = 2000
 # 短Chunk合并阈值：同父标题的短Chunk会被合并，减少碎片化
 MIN_CONTENT_LENGTH = 500
+SECTION_MAX_CONTENT_LENGTH = 1000
+SECTION_MIN_CONTENT_LENGTH = 350
+
+EXAM_YEAR_PATTERN = re.compile(r"(19\d{2}|20\d{2})")
+EXAM_SCORE_PATTERN = re.compile(r"(\d{1,3})\s*(?:分|points?|pts?)", re.IGNORECASE)
+EXAM_QUESTION_PATTERNS = [
+    re.compile(r"(?m)^\s*([一二三四五六七八九十]+)[、.．:：\s]+([^\n]{0,80})"),
+    re.compile(r"(?m)^\s*第\s*([一二三四五六七八九十\d]+)\s*[题題][、.．:：\s]*([^\n]{0,80})"),
+    re.compile(r"(?m)^\s*(\d{1,2})[、.．:：\s]+([^\n]{0,80})"),
+]
+EXAM_TYPE_KEYWORDS = [
+    "选择", "填空", "判断", "简答", "计算", "证明", "编程", "分析", "设计", "应用", "综合", "作图", "问答", "解答",
+]
+EXAM_TOPIC_KEYWORDS = [
+    "插值", "Hermite", "埃尔米特", "拉格朗日", "牛顿", "差商", "拟合", "最小二乘",
+    "数值积分", "数值微分", "梯形", "辛普森", "Simpson", "方程求根", "二分法",
+    "牛顿法", "迭代", "收敛", "误差", "线性方程组", "高斯", "矩阵", "特征值",
+    "微分方程", "Euler", "龙格", "Runge", "稳定性",
+]
+QUESTION_SECTION_PATTERN = re.compile(
+    r"(?m)^\s*((?:第\s*)?[一二三四五六七八九十\d]{1,3}\s*(?:题|題)|[一二三四五六七八九十\d]{1,3}\s*[、.．])"
+)
+
+
+def _compact_exam_text(text: str, limit: int = 1200) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()[:limit]
+
+
+def _first_match(pattern: re.Pattern, text: str) -> str:
+    match = pattern.search(text or "")
+    return match.group(1) if match else ""
+
+
+def _infer_exam_question(text: str) -> tuple[str, str]:
+    for pattern in EXAM_QUESTION_PATTERNS:
+        match = pattern.search(text or "")
+        if match:
+            return match.group(1).strip(), _compact_exam_text(match.group(2), 80)
+    return "", ""
+
+
+def _infer_exam_question_type(text: str) -> str:
+    lowered = (text or "").lower()
+    for keyword in EXAM_TYPE_KEYWORDS:
+        if keyword.lower() in lowered:
+            return keyword
+    return ""
+
+
+def _infer_exam_topics(text: str, limit: int = 5) -> str:
+    lowered = (text or "").lower()
+    topics = []
+    for keyword in EXAM_TOPIC_KEYWORDS:
+        if keyword.lower() in lowered and keyword not in topics:
+            topics.append(keyword)
+    return "、".join(topics[:limit])
+
+
+def infer_topics(text: str, limit: int = 5) -> str:
+    return _infer_exam_topics(text, limit=limit)
+
+
+def split_question_sections(sections: List[Dict[str, Any]], material_type: str) -> List[Dict[str, Any]]:
+    if material_type not in {"exam", "exam_answer", "homework"}:
+        return sections
+
+    result = []
+    for section in sections:
+        content = section.get("content", "") or ""
+        matches = list(QUESTION_SECTION_PATTERN.finditer(content))
+        if len(matches) < 2:
+            result.append(section)
+            continue
+
+        prefix = content[: matches[0].start()].strip()
+        for index, match in enumerate(matches, start=1):
+            start = match.start()
+            end = matches[index].start() if index < len(matches) else len(content)
+            block = content[start:end].strip()
+            if not block:
+                continue
+            title_text = block.splitlines()[0].strip()[:80]
+            if prefix and index == 1:
+                block = prefix + "\n\n" + block
+            item = dict(section)
+            item["title"] = f"{section.get('title') or section.get('file_title', '')} / {title_text}".strip(" /")
+            item["parent_title"] = section.get("title") or section.get("parent_title") or section.get("file_title", "")
+            item["content"] = block
+            item["part"] = index
+            result.append(item)
+    return result
+
+
+def enrich_common_chunk_metadata(chunk: Dict[str, Any], state: ImportGraphState) -> None:
+    scan_text = "\n".join([
+        str(chunk.get("file_title") or state.get("file_title", "")),
+        str(chunk.get("title") or ""),
+        str(chunk.get("content") or "")[:2000],
+    ])
+    topics = infer_topics(scan_text)
+    chunk["topics"] = topics
+    chunk["primary_topic"] = topics.split("、")[0] if topics else ""
+
+
+def enrich_exam_chunk_metadata(chunk: Dict[str, Any], state: ImportGraphState) -> None:
+    if chunk.get("material_type") != "exam":
+        return
+
+    file_title = str(chunk.get("file_title") or state.get("file_title", ""))
+    title = str(chunk.get("title") or "")
+    content = str(chunk.get("content") or "")
+    scan_text = f"{file_title}\n{title}\n{content[:2000]}"
+    question_no, question_title = _infer_exam_question(scan_text)
+    score = _first_match(EXAM_SCORE_PATTERN, scan_text)
+    is_reference_answer = bool(re.search(r"(参考答案|答案|解析|评分|answer|solution)", scan_text, re.IGNORECASE))
+
+    chunk["exam_year"] = _first_match(EXAM_YEAR_PATTERN, scan_text)
+    chunk["exam_question_no"] = question_no
+    chunk["exam_question_title"] = question_title
+    chunk["exam_question_type"] = _infer_exam_question_type(scan_text)
+    chunk["exam_score"] = int(score) if score.isdigit() else 0
+    chunk["exam_topics"] = _infer_exam_topics(scan_text)
+    chunk["is_reference_answer"] = is_reference_answer
 
 def step1_load_input(state: ImportGraphState) -> Tuple[str, str]:
     """
@@ -231,12 +354,21 @@ def node_document_split(state: ImportGraphState) -> ImportGraphState:
         if title_count == 0:
             logger.info(f"{func_name} - 未识别到有效标题，启用无标题兜底处理")
             sections = [{"title": "无标题", "content": content, "file_title": file_title}]
+        material_type = state.get("material_type", "other")
+        sections = split_question_sections(sections, material_type)
         # 4. 长切短合处理：对初切后的Chunk列表进行长度检查，超过max_content_length的Chunk会被进一步切分；同时对同父标题的短Chunk进行合并，减少碎片化
-        processed_chunks = step4_split_and_merge(sections, DEFAULT_MAX_CONTENT_LENGTH,MIN_CONTENT_LENGTH)
+        max_len = DEFAULT_MAX_CONTENT_LENGTH
+        min_len = MIN_CONTENT_LENGTH
+        if material_type in {"textbook", "slides", "courseware", "other"}:
+            max_len = SECTION_MAX_CONTENT_LENGTH
+            min_len = SECTION_MIN_CONTENT_LENGTH
+        processed_chunks = step4_split_and_merge(sections, max_len, min_len)
         for chunk in processed_chunks:
             chunk["course_id"] = state.get("course_id", "")
             chunk["course_name"] = state.get("course_name", "")
-            chunk["material_type"] = state.get("material_type", "other")
+            chunk["material_type"] = material_type
+            enrich_common_chunk_metadata(chunk, state)
+            enrich_exam_chunk_metadata(chunk, state)
         # 5. 结果备份：将处理后的Chunk列表存储到状态字典中，便于后续节点使用
         state["chunks"] = processed_chunks
         step5_backup_results(state, processed_chunks)

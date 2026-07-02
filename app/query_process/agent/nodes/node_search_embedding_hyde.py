@@ -15,6 +15,28 @@ from app.conf.milvus_config import milvus_config
 from app.utils.escape_milvus_string_utils import escape_milvus_string
 load_dotenv(find_dotenv())
 
+OUTPUT_FIELDS = [
+    "chunk_id",
+    "content",
+    "item_name",
+    "course_id",
+    "course_name",
+    "material_type",
+    "file_title",
+    "title",
+    "parent_title",
+    "part",
+    "exam_year",
+    "exam_question_no",
+    "exam_question_title",
+    "exam_question_type",
+    "exam_score",
+    "exam_topics",
+    "is_reference_answer",
+    "topics",
+    "primary_topic",
+]
+
 def step1_generate_hyde_document(query)->str:
     """
     Step 1: 生成假设文档
@@ -119,7 +141,7 @@ def node_search_embedding_hyde(state):
             hyde_document,
             item_names,
             top_k=8 if state.get("mode") == "exam" else 5,
-            output_fields=["chunk_id", "content", "item_name", "course_id", "course_name", "material_type", "file_title"],
+            output_fields=OUTPUT_FIELDS,
             course_id=course_id,
         )
         add_done_task(state["session_id"], function_name, state.get("is_stream", False))

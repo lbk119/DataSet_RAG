@@ -16,7 +16,45 @@ from app.utils.escape_milvus_string_utils import escape_milvus_string
 load_dotenv(find_dotenv())
 
 EXAM_CONTEXT_LIMIT = 30
-OUTPUT_FIELDS = ["chunk_id", "content", "item_name", "course_id", "course_name", "material_type", "file_title"]
+INITIAL_RECALL_LIMIT = int(os.getenv("RAG_INITIAL_RECALL_LIMIT", "30"))
+OUTPUT_FIELDS = [
+    "chunk_id",
+    "content",
+    "item_name",
+    "course_id",
+    "course_name",
+    "material_type",
+    "file_title",
+    "title",
+    "parent_title",
+    "part",
+    "exam_year",
+    "exam_question_no",
+    "exam_question_title",
+    "exam_question_type",
+    "exam_score",
+    "exam_topics",
+    "is_reference_answer",
+    "topics",
+    "primary_topic",
+]
+
+
+def infer_query_intent(query: str, mode: str = "qa") -> str:
+    text = query or ""
+    if mode == "exam" or any(word in text for word in ["出卷", "模拟卷", "期末试卷", "预测", "往年试卷", "题型结构"]):
+        return "exam"
+    if any(word in text for word in ["已知", "求", "计算", "证明", "构造", "解", "迭代", "公式为", "步骤"]):
+        return "problem"
+    return "concept"
+
+
+def preferred_material_types(intent: str) -> list[str]:
+    if intent == "exam":
+        return ["exam", "exam_answer"]
+    if intent == "problem":
+        return ["homework", "exam_answer", "exam"]
+    return ["textbook", "slides", "courseware", "homework"]
 
 
 def _build_course_expr(course_id: str, mode: str = "qa") -> str:
@@ -82,6 +120,9 @@ def node_search_embedding(state:QueryGraphState)->QueryGraphState:
     query = state.get("rewritten_query", "")
     item_names = state.get("item_names", [])
     course_id = state.get("course_id", "")
+    query_intent = infer_query_intent(query or state.get("original_query", ""), state.get("mode", "qa"))
+    state["query_intent"] = query_intent
+    state["preferred_material_types"] = preferred_material_types(query_intent)
     if not item_names and not course_id:
         logger.warning(f"- {function_name} - 没有确认的商品名称，无法执行基于商品过滤的检索")
         state["embedding_chunks"] = []
@@ -90,17 +131,12 @@ def node_search_embedding(state:QueryGraphState)->QueryGraphState:
     logger.info(f"- {function_name} - 开始执行，输入状态: rewritten_query='{query}', item_names={item_names}")
     collection_name = milvus_config.chunks_collection
     client = get_milvus_client()
+    exam_chunks = []
     if state.get("mode") == "exam" and course_id:
         print(f"[node_search_embedding] exam mode: fetching exam chunks before embedding session={state['session_id']}", flush=True)
         exam_chunks = _fetch_exam_chunks(client, collection_name, course_id)
         if exam_chunks:
-            state["embedding_chunks"] = []
             state["exam_chunks"] = exam_chunks
-            add_done_task(state["session_id"], function_name, state.get("is_stream", False))
-            return {
-                "embedding_chunks": [],
-                "exam_chunks": exam_chunks,
-            }
 
     # 1. 对改写后的用户问题执行向量化，生成BGEM3稠密+稀疏向量
     print(f"[node_search_embedding] importing embedding utils session={state['session_id']}", flush=True)
@@ -116,7 +152,7 @@ def node_search_embedding(state:QueryGraphState)->QueryGraphState:
     else:
         expr_str = ", ".join([f'"{name}"' for name in item_names])  # 构造过滤表达式字符串
         expr = f'item_name in [{expr_str}]'  # 构造最终过滤表达式
-    search_requests = create_hybrid_search_requests(dense_vector, sparse_vector, expr = expr, limit = 10)
+    search_requests = create_hybrid_search_requests(dense_vector, sparse_vector, expr=expr, limit=INITIAL_RECALL_LIMIT)
     # 4. 执行Milvus稠密+稀疏混合向量检索
     search_results = hybrid_search(
         client,
@@ -124,18 +160,48 @@ def node_search_embedding(state:QueryGraphState)->QueryGraphState:
         search_requests,
         (0.9, 0.1),
         True,
-        12 if state.get("mode") == "exam" else 5,
+        INITIAL_RECALL_LIMIT,
         output_fields=OUTPUT_FIELDS,
     ) 
     state["embedding_chunks"] = search_results[0] if search_results else []  # 获取第一个请求的检索结果，若无结果则为空列表
-    exam_chunks = []
+    preferred_chunks = []
+    if course_id and state.get("preferred_material_types"):
+        material_values = ", ".join([f'"{escape_milvus_string(item)}"' for item in state["preferred_material_types"]])
+        preferred_expr = f'course_id == "{escape_milvus_string(course_id)}" and material_type in [{material_values}]'
+        preferred_requests = create_hybrid_search_requests(dense_vector, sparse_vector, expr=preferred_expr, limit=INITIAL_RECALL_LIMIT)
+        preferred_results = hybrid_search(
+            client,
+            collection_name,
+            preferred_requests,
+            (0.9, 0.1),
+            True,
+            INITIAL_RECALL_LIMIT,
+            output_fields=OUTPUT_FIELDS,
+        )
+        preferred_chunks = preferred_results[0] if preferred_results else []
+        state["preferred_material_chunks"] = preferred_chunks
+    exam_semantic_chunks = []
     if state.get("mode") == "exam" and course_id:
-        exam_chunks = _fetch_exam_chunks(client, collection_name, course_id)
+        exam_expr = f'course_id == "{escape_milvus_string(course_id)}" and material_type == "exam"'
+        exam_requests = create_hybrid_search_requests(dense_vector, sparse_vector, expr=exam_expr, limit=16)
+        exam_results = hybrid_search(
+            client,
+            collection_name,
+            exam_requests,
+            (0.9, 0.1),
+            True,
+            16,
+            output_fields=OUTPUT_FIELDS,
+        )
+        exam_semantic_chunks = exam_results[0] if exam_results else []
+        state["exam_semantic_chunks"] = exam_semantic_chunks
         state["exam_chunks"] = exam_chunks
     add_done_task(state["session_id"], function_name, state.get("is_stream", False))
     return {
         "embedding_chunks": state["embedding_chunks"],
+        "preferred_material_chunks": preferred_chunks,
         "exam_chunks": exam_chunks,
+        "exam_semantic_chunks": exam_semantic_chunks,
     }
 
 

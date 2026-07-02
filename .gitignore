@@ -22,6 +22,7 @@ env/
 # Environment and local secrets
 .env
 .env.*
+!.env.example
 
 # Editor and OS files
 .vscode/
@@ -39,6 +40,8 @@ logs/
 doc/
 output/
 volumes/
+evals/reports/
+evals/sample_docs/
 
 # Local data or model caches
 .cache/

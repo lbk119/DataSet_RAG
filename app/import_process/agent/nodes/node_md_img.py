@@ -109,6 +109,10 @@ def step2_scan_images(md_content: str, images_dir: Path) -> List[Tuple[str,str, 
     :return: 待处理图片列表，每个元素为(图片文件名, 图片完整路径, 图片上下文)元组
     """
     images_info = []
+    if not images_dir.exists() or not images_dir.is_dir():
+        logger.info(f"图片文件夹不存在，跳过图片扫描：{images_dir.absolute()}")
+        return images_info
+
     for img_file in images_dir.iterdir():
         if img_file.is_file() and is_supported_image(img_file.name):
             # 查找该图片在MD中的所有引用位置，并提取上下文
@@ -338,7 +342,7 @@ def node_md_img(state: ImportGraphState) -> ImportGraphState:
     md_content,path_obj,images_dir = step1_get_content(state)
     state["md_content"] = md_content
     # 无图片文件夹，直接跳过所有图片处理逻辑
-    if not images_dir:
+    if not images_dir.exists() or not images_dir.is_dir():
         logger.info(f"Task {state['task_id']}: 图片文件夹不存在，跳过图片处理：{images_dir.absolute()}")
         return state
     # 初始化MinIO客户端，失败则终止流程

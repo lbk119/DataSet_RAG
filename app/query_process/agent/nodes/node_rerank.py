@@ -15,6 +15,7 @@ load_dotenv()
 # 动态 TopK 硬上限：最多取前 N 条（< 10）
 RERANK_MAX_TOPK: int = 10
 EXAM_RERANK_MAX_TOPK: int = 24
+QA_RERANK_MAX_TOPK: int = 5
 # 最小 TopK：至少保留前 N 条（> 1，且 < RERANK_MAX_TOPK）
 RERANK_MIN_TOPK: int = 1
 # 断崖阈值（相对）
@@ -53,12 +54,26 @@ def step1_merge_docs(state) -> list:
     standardized_docs = []
     # 2. 标准化 RRF 文档
     for chunk in rrf_chunks:
+        entity = chunk["entity"]
         standardized_docs.append({
-            "text": chunk["entity"]["content"],
-            "chunk_id": chunk["entity"]["chunk_id"],
-            "title": chunk["entity"].get("file_title") or chunk["entity"].get("item_name", ""),
-            "material_type": chunk["entity"].get("material_type", ""),
-            "course_name": chunk["entity"].get("course_name", ""),
+            "text": entity["content"],
+            "chunk_id": entity["chunk_id"],
+            "title": entity.get("file_title") or entity.get("title") or entity.get("item_name", ""),
+            "file_title": entity.get("file_title", ""),
+            "parent_title": entity.get("parent_title", ""),
+            "part": entity.get("part", 1),
+            "material_type": entity.get("material_type", ""),
+            "course_id": entity.get("course_id", ""),
+            "course_name": entity.get("course_name", ""),
+            "exam_year": entity.get("exam_year", ""),
+            "exam_question_no": entity.get("exam_question_no", ""),
+            "exam_question_title": entity.get("exam_question_title", ""),
+            "exam_question_type": entity.get("exam_question_type", ""),
+            "exam_score": entity.get("exam_score", 0),
+            "exam_topics": entity.get("exam_topics", ""),
+            "topics": entity.get("topics", ""),
+            "primary_topic": entity.get("primary_topic", ""),
+            "is_reference_answer": entity.get("is_reference_answer", False),
             "url": "",
             "source": "local"
         })
@@ -100,6 +115,9 @@ def step2_rerank_docs(state, docs) -> list:
     # 4. 将得分附加回文档列表
     for doc, score in zip(docs, scored_docs):
         doc["score"] = score
+        if doc.get("material_type") in state.get("preferred_material_types", []):
+            index = state.get("preferred_material_types", []).index(doc.get("material_type"))
+            doc["score"] = score + max(0.02, 0.08 - index * 0.02)
     docs.sort(key=lambda doc: doc.get("score", 0.0), reverse=True)
     return docs
 
@@ -114,7 +132,7 @@ def step3_dynamic_topk(scored_docs) -> list:
     :return: 列表，动态截断后的TopK文档列表，数量≤10
     """
     # 硬上限：最多取前10条，取全局常量与实际文档数的较小值（避免索引越界）
-    max_topk = min(RERANK_MAX_TOPK, len(scored_docs))
+    max_topk = min(QA_RERANK_MAX_TOPK, len(scored_docs))
     min_topk = RERANK_MIN_TOPK # 硬下限：至少保留的文档数量（全局常量配置）
     gap_ratio = RERANK_GAP_RATIO # 相对断崖阈值：分数下降的相对比例阈值（全局常量配置）
     gap_abs = RERANK_GAP_ABS # 绝对断崖阈值：分数下降的绝对差值阈值（全局常量配置）

@@ -43,7 +43,10 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-@app.on_event("startup")
+# Startup warmup disabled: importing pymilvus in a background thread made the
+# query service exit immediately in some Windows/uvicorn environments.
+# The Milvus client is initialized lazily when the first query needs it.
+# @app.on_event("startup")
 def warmup_heavy_dependencies():
     def _warmup():
         try:
@@ -157,12 +160,18 @@ async def query(query_request: QueryRequest, background_tasks: BackgroundTasks):
     update_task_status(session_id, "processing",is_stream)
 
     if is_stream:
-        # 立即返回流式响应，后台任务继续执行图流程并通过SSE推送结果
-        threading.Thread(
-            target=run_query_graph,
-            args=(session_id, query_request.query, is_stream, course_id, course_name, mode, ""),
-            daemon=True,
-        ).start()
+        # 立即返回流式响应，后台任务继续执行图流程并通过SSE推送结果。
+        # 不使用 daemon thread，避免 CUDA/Milvus 等原生库在后台线程结束后触发进程异常退出。
+        background_tasks.add_task(
+            run_query_graph,
+            session_id,
+            query_request.query,
+            is_stream,
+            course_id,
+            course_name,
+            mode,
+            "",
+        )
         print("结果正在生成中，请稍候...")
         return {
             "message": "结果正在生成中，请稍候...",
@@ -241,11 +250,17 @@ async def query_with_files(
     update_task_status(session_id, "processing", is_stream)
 
     if is_stream:
-        threading.Thread(
-            target=run_query_graph_with_attachments,
-            args=(session_id, final_query, is_stream, course_id, course_name, mode or "qa", saved_paths, work_dir),
-            daemon=True,
-        ).start()
+        background_tasks.add_task(
+            run_query_graph_with_attachments,
+            session_id,
+            final_query,
+            is_stream,
+            course_id,
+            course_name,
+            mode or "qa",
+            saved_paths,
+            work_dir,
+        )
         return {
             "message": "结果正在生成中，请稍候...",
             "session_id": session_id,

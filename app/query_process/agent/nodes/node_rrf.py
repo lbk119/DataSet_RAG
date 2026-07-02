@@ -10,6 +10,9 @@ from typing import List, Dict, Any
 from app.utils.task_utils import add_running_task, add_done_task
 from app.core.logger import logger
 
+RRF_QA_CANDIDATE_LIMIT = int(os.getenv("RAG_RRF_QA_CANDIDATE_LIMIT", "30"))
+RRF_EXAM_CANDIDATE_LIMIT = int(os.getenv("RAG_RRF_EXAM_CANDIDATE_LIMIT", "24"))
+
 
 def get_chunk_id(chunk: Dict[str, Any]) -> Any:
     entity = chunk.get("entity", {})
@@ -42,6 +45,31 @@ def step2_reciprocal_rank(source_weights: List[tuple], k: int = 5) -> List[Dict[
     merged = [item[0] for item in merged[:k]] # 取前K个chunk实体
     return merged
 
+
+def _material_boost(chunk: Dict[str, Any], preferred_material_types: list[str]) -> float:
+    entity = chunk.get("entity", {})
+    material_type = entity.get("material_type", "")
+    if material_type in preferred_material_types:
+        index = preferred_material_types.index(material_type)
+        return max(1.05, 1.35 - index * 0.1)
+    return 1.0
+
+
+def step2_reciprocal_rank_with_material_boost(source_weights: List[tuple], preferred_material_types: list[str], k: int = 5) -> List[Dict[str, Any]]:
+    score_dict = {}
+    chunks_dict = {}
+    for chunks, weight in source_weights:
+        for rank, chunk in enumerate(chunks, start=1):
+            chunk_id = get_chunk_id(chunk)
+            if not chunk_id:
+                continue
+            boost = _material_boost(chunk, preferred_material_types)
+            score_dict[chunk_id] = (1.0 / (rank + 60)) * weight * boost + score_dict.get(chunk_id, 0.0)
+            chunks_dict.setdefault(chunk_id, chunk)
+    merged = [(chunks_dict[chunk_id], score) for chunk_id, score in score_dict.items()]
+    merged.sort(key=lambda x: x[1], reverse=True)
+    return [item[0] for item in merged[:k]]
+
 def node_rrf(state):
     """
     RRF (Reciprocal Rank Fusion) 倒数排名融合节点
@@ -63,14 +91,19 @@ def node_rrf(state):
     embedding_chunks = state.get("embedding_chunks", [])
     hyde_embedding_chunks = state.get("hyde_embedding_chunks", [])
     exam_chunks = state.get("exam_chunks", [])
+    exam_semantic_chunks = state.get("exam_semantic_chunks", [])
+    preferred_material_chunks = state.get("preferred_material_chunks", [])
+    preferred_material_types = state.get("preferred_material_types", [])
     source_weights = [
-        (exam_chunks, 3.0),  # 出卷模式下额外召回的试卷切片优先级最高
+        (exam_chunks, 4.0),  # 出卷模式下额外召回的试卷切片优先级最高
+        (exam_semantic_chunks, 3.0),
+        (preferred_material_chunks, 2.0),
         (embedding_chunks, 1.0),  # Embedding检索权重
         (hyde_embedding_chunks, 1.0)  # HyDE检索权重
     ]
     # 2. 应用带权重的RRF计算最终得分
-    top_k = 20 if state.get("mode") == "exam" else 5
-    response = step2_reciprocal_rank(source_weights, k=top_k)
+    top_k = RRF_EXAM_CANDIDATE_LIMIT if state.get("mode") == "exam" else RRF_QA_CANDIDATE_LIMIT
+    response = step2_reciprocal_rank_with_material_boost(source_weights, preferred_material_types, k=top_k)
     # 3. 更新状态并返回结果
     state["rrf_chunks"] = response
     add_done_task(state["session_id"], function_name, state.get("is_stream", False))
